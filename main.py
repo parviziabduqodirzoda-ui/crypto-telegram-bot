@@ -1,39 +1,29 @@
 import telebot
-import requests
-import time
-
+from flask import Flask, request
 import os
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-bot = telebot.TeleBot(BOT_TOKEN)
 
+TOKEN = os.environ.get("BOT_TOKEN")  # токен из переменных окружения
+bot = telebot.TeleBot(TOKEN)
+app = Flask(__name__)
+
+# --- Обработчик команды /start ---
 @bot.message_handler(commands=['start'])
 def start(message):
-    bot.reply_to(message, "Бот работает! Получаю данные с Bybit...")
+    bot.send_message(message.chat.id, "Бот запущен! ✅")
 
-def get_price(symbol="BTCUSDT"):
-    url = f"https://api.bybit.com/v5/market/tickers?category=spot&symbol={symbol}"
-    data = requests.get(url).json()
-    try:
-        return float(data["result"]["list"][0]["lastPrice"])
-    except Exception:
-        return None
+# --- Flask маршруты для Render ---
+@app.route('/' + TOKEN, methods=['POST'])
+def getMessage():
+    json_str = request.stream.read().decode('UTF-8')
+    update = telebot.types.Update.de_json(json_str)
+    bot.process_new_updates([update])
+    return '!', 200
 
-@bot.message_handler(commands=['price'])
-def price(message):
-    price_btc = get_price("BTCUSDT")
-    price_eth = get_price("ETHUSDT")
-    price_xaut = get_price("XAUTUSDT")
-    bot.reply_to(
-        message,
-        f"💰 Актуальные цены:\n\n"
-        f"BTC/USDT: {price_btc}\n"
-        f"ETH/USDT: {price_eth}\n"
-        f"XAUT/USDT: {price_xaut}"
-    )
+@app.route('/')
+def webhook():
+    bot.remove_webhook()
+    bot.set_webhook(url=f"https://{os.environ.get('RENDER_EXTERNAL_HOSTNAME')}/{TOKEN}")
+    return 'Webhook установлен успешно!', 200
 
-while True:
-    try:
-        bot.polling(none_stop=True, interval=3)
-    except Exception as e:
-        print("Ошибка:", e)
-        time.sleep(5)
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
