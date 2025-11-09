@@ -1,137 +1,149 @@
 import os
 import time
+import threading
 import telebot
-from pybit.unified_trading import HTTP
 import pandas as pd
 import numpy as np
-import talib
-from datetime import datetime, timedelta
+from flask import Flask, request
+from pybit.unified_trading import HTTP
+from datetime import datetime
 
-# === Настройки ===
+# --- Настройки ---
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 BYBIT_API_KEY = os.environ.get("BYBIT_API_KEY")
 BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET")
-USE_TESTNET = os.environ.get("USE_TESTNET", "True").lower() == "true"
+CHAT_ID = 5198342012  # твой Telegram ID
+CHECK_INTERVAL = 300  # 5 минут
 
 bot = telebot.TeleBot(BOT_TOKEN)
-CHAT_ID = 5198342012  # твой Telegram ID
+app = Flask(__name__)
 
-session = HTTP(
-    testnet=USE_TESTNET,
-    api_key=BYBIT_API_KEY,
-    api_secret=BYBIT_API_SECRET
-)
+session = HTTP(api_key=BYBIT_API_KEY, api_secret=BYBIT_API_SECRET)
 
-# === Список активов ===
 SYMBOLS = [
-    "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
-    "ADAUSDT", "DOGEUSDT", "AVAXUSDT", "DOTUSDT", "LINKUSDT",
-    "LTCUSDT", "TRXUSDT", "UNIUSDT", "MATICUSDT", "APTUSDT",
-    "ARBUSDT", "OPUSDT", "NEARUSDT", "ATOMUSDT", "FILUSDT"
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT",
+    "ADAUSDT", "AVAXUSDT", "DOTUSDT", "LTCUSDT", "LINKUSDT",
+    "MATICUSDT", "DOGEUSDT", "OPUSDT", "ARBUSDT", "APTUSDT",
+    "NEARUSDT", "ATOMUSDT", "FILUSDT", "SUIUSDT", "TONUSDT"
 ]
 
-# === Получение данных с Bybit ===
-def get_klines(symbol, interval="15", limit=200):
+# --- Получаем исторические данные ---
+def get_klines(symbol, interval="15"):
     try:
-        data = session.get_kline(category="linear", symbol=symbol, interval=interval, limit=limit)
-        df = pd.DataFrame(data['result']['list'], columns=[
-            "timestamp", "open", "high", "low", "close", "volume", "_", "_", "_", "_", "_", "_"
+        resp = session.get_kline(category="linear", symbol=symbol, interval=interval, limit=200)
+        data = pd.DataFrame(resp["result"]["list"], columns=[
+            "timestamp", "open", "high", "low", "close", "volume", "turnover"
         ])
-        df = df.astype(float)
-        df["time"] = pd.to_datetime(df["timestamp"], unit='s')
-        df = df[::-1]
-        return df
+        data = data.astype(float)
+        data["time"] = pd.to_datetime(data["timestamp"], unit='s')
+        return data.sort_values("time")
     except Exception as e:
-        print(f"Ошибка загрузки данных {symbol}: {e}")
+        print(f"Ошибка получения данных для {symbol}: {e}")
         return None
 
-# === Поиск уровней поддержки и сопротивления ===
-def find_levels(df, sensitivity=3):
-    levels = []
-    for i in range(sensitivity, len(df)-sensitivity):
-        high_range = df["high"][i-sensitivity:i+sensitivity]
-        low_range = df["low"][i-sensitivity:i+sensitivity]
-        if df["high"][i] == high_range.max():
-            levels.append(df["high"][i])
-        if df["low"][i] == low_range.min():
-            levels.append(df["low"][i])
-    return list(set([round(l, 2) for l in levels]))
+# --- Технический анализ ---
+def technical_analysis(df):
+    df["ema50"] = df["close"].ewm(span=50).mean()
+    df["ema200"] = df["close"].ewm(span=200).mean()
+    df["rsi"] = 100 - (100 / (1 + (df["close"].diff().clip(lower=0).rolling(14).mean() /
+                                   df["close"].diff().clip(upper=0).abs().rolling(14).mean())))
+    short_ema = df["close"].ewm(span=12).mean()
+    long_ema = df["close"].ewm(span=26).mean()
+    df["macd"] = short_ema - long_ema
+    df["signal"] = df["macd"].ewm(span=9).mean()
 
-# === Проверка сигналов ===
-def analyze_symbol(symbol):
-    df_15m = get_klines(symbol, "15", 200)
-    df_1h = get_klines(symbol, "60", 200)
-    if df_15m is None or len(df_15m) < 50:
-        return None
+    last = df.iloc[-1]
+    trend = "long" if last["ema50"] > last["ema200"] else "short"
+    rsi_signal = "long" if last["rsi"] < 30 else "short" if last["rsi"] > 70 else None
+    macd_signal = "long" if last["macd"] > last["signal"] else "short"
 
-    close = df_15m["close"].values
-    high = df_15m["high"].values
-    low = df_15m["low"].values
+    return trend, rsi_signal, macd_signal
 
-    # Индикаторы
-    rsi = talib.RSI(close, timeperiod=14)
-    macd, macdsignal, _ = talib.MACD(close)
-    ma_fast = talib.SMA(close, 9)
-    ma_slow = talib.SMA(close, 21)
-
-    # Свечные паттерны
-    hammer = talib.CDLHAMMER(df_15m["open"], high, low, close)
-    engulf = talib.CDLENGULFING(df_15m["open"], high, low, close)
-
-    # Уровни поддержки/сопротивления на старшем ТФ
-    levels_h = find_levels(df_1h)
-    current_price = close[-1]
-
-    # Проверка на близость к уровню
-    near_level = any(abs(current_price - lvl) / current_price < 0.01 for lvl in levels_h)
-
-    # Условия на лонг и шорт
-    bullish = (
-        ma_fast[-1] > ma_slow[-1] and
-        macd[-1] > macdsignal[-1] and
-        rsi[-1] < 70 and
-        (hammer[-1] != 0 or engulf[-1] > 0) and
-        near_level
-    )
-
-    bearish = (
-        ma_fast[-1] < ma_slow[-1] and
-        macd[-1] < macdsignal[-1] and
-        rsi[-1] > 30 and
-        (hammer[-1] != 0 or engulf[-1] < 0) and
-        near_level
-    )
-
-    # Формирование сигнала
+# --- Свечной анализ (паттерны) ---
+def candle_patterns(df):
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+    bullish = last["close"] > last["open"] and prev["close"] < prev["open"] and last["open"] < prev["close"]
+    bearish = last["close"] < last["open"] and prev["close"] > prev["open"] and last["open"] > prev["close"]
     if bullish:
-        entry = current_price
-        sl = round(entry * 0.97, 2)
-        tp1 = round(entry * 1.03, 2)
-        tp2 = round(entry * 1.05, 2)
-        tp3 = round(entry * 1.07, 2)
-        return f"📈 {symbol}\nЛонг\nSL: {sl}\nTP1: {tp1}\nTP2: {tp2}\nTP3: {tp3}"
-
+        return "long"
     elif bearish:
-        entry = current_price
-        sl = round(entry * 1.03, 2)
-        tp1 = round(entry * 0.97, 2)
-        tp2 = round(entry * 0.95, 2)
-        tp3 = round(entry * 0.93, 2)
-        return f"📉 {symbol}\nШорт\nSL: {sl}\nTP1: {tp1}\nTP2: {tp2}\nTP3: {tp3}"
-
+        return "short"
     return None
 
-# === Основной цикл ===
-def main_loop():
-    print("🚀 Бот запущен и анализирует рынок...")
-    while True:
-        for sym in SYMBOLS:
-            signal = analyze_symbol(sym)
-            if signal:
-                bot.send_message(CHAT_ID, signal)
-                print(f"✅ Сигнал отправлен: {signal}")
-            time.sleep(3)  # Пауза между активами
-        time.sleep(60 * 15)  # Проверка каждые 15 минут
+# --- Поддержка / сопротивление ---
+def support_resistance(df):
+    recent = df.tail(50)
+    support = recent["low"].min()
+    resistance = recent["high"].max()
+    last_close = recent.iloc[-1]["close"]
+    if last_close <= support * 1.01:
+        return "long"
+    elif last_close >= resistance * 0.99:
+        return "short"
+    return None
 
+# --- Имбаланс ---
+def imbalance_check(df):
+    avg_vol = df["volume"].mean()
+    last_vol = df.iloc[-1]["volume"]
+    return "long" if last_vol > 1.5 * avg_vol and df.iloc[-1]["close"] > df.iloc[-2]["close"] else \
+           "short" if last_vol > 1.5 * avg_vol and df.iloc[-1]["close"] < df.iloc[-2]["close"] else None
+
+# --- Проверка и отправка сигналов ---
+def check_signals():
+    while True:
+        for symbol in SYMBOLS:
+            print(f"Проверка {symbol}...")
+            df = get_klines(symbol)
+            if df is None:
+                continue
+
+            trend, rsi_signal, macd_signal = technical_analysis(df)
+            pattern_signal = candle_patterns(df)
+            level_signal = support_resistance(df)
+            imbalance_signal = imbalance_check(df)
+
+            signals = [trend, rsi_signal, macd_signal, pattern_signal, level_signal, imbalance_signal]
+            longs = signals.count("long")
+            shorts = signals.count("short")
+
+            if longs >= 4:
+                tp1 = round(df.iloc[-1]["close"] * 1.03, 2)
+                tp2 = round(df.iloc[-1]["close"] * 1.05, 2)
+                tp3 = round(df.iloc[-1]["close"] * 1.07, 2)
+                sl = round(df.iloc[-1]["close"] * 0.97, 2)
+                msg = f"📈 {symbol}\nЛонг\nSL: {sl}\nTP1: {tp1}\nTP2: {tp2}\nTP3: {tp3}"
+                bot.send_message(CHAT_ID, msg)
+
+            elif shorts >= 4:
+                tp1 = round(df.iloc[-1]["close"] * 0.97, 2)
+                tp2 = round(df.iloc[-1]["close"] * 0.95, 2)
+                tp3 = round(df.iloc[-1]["close"] * 0.93, 2)
+                sl = round(df.iloc[-1]["close"] * 1.03, 2)
+                msg = f"📉 {symbol}\nШорт\nSL: {sl}\nTP1: {tp1}\nTP2: {tp2}\nTP3: {tp3}"
+                bot.send_message(CHAT_ID, msg)
+
+        time.sleep(CHECK_INTERVAL)
+
+# --- Flask маршруты ---
+@app.route('/' + BOT_TOKEN, methods=['POST'])
+def webhook_post():
+    update = telebot.types.Update.de_json(request.stream.read().decode('utf-8'))
+    bot.process_new_updates([update])
+    return "ok", 200
+
+@app.route('/')
+def webhook():
+    bot.remove_webhook()
+    bot.set_webhook(url=f"https://{os.environ.get('RENDER_EXTERNAL_HOSTNAME')}/{BOT_TOKEN}")
+    return "Webhook установлен успешно!", 200
+
+@bot.message_handler(commands=["start"])
+def start_msg(message):
+    bot.send_message(message.chat.id, "✅ Бот активен и мониторит рынок 24/7!")
+
+# --- Запуск ---
 if __name__ == "__main__":
-    main_loop()
+    threading.Thread(target=check_signals, daemon=True).start()
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
