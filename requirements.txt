@@ -1,6 +1,5 @@
-
 Flask==3.0.3
-pyTelegramBotAPI==4.15.0
-pybit==5.6.2
-pandas==2.2.2
-numpy==1.26.2
+pytelegrambotapi==4.14.0
+pybit==5.6.1
+requests==2.31.0
+python-dotenv==1.0.1
