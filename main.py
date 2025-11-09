@@ -1,95 +1,107 @@
 import os
-import logging
+import requests
 from flask import Flask, request
-import telebot
-from telebot import types
 from pybit.unified_trading import HTTP
+from dotenv import load_dotenv
 
-# === Логирование ===
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# ==============================
+# Загружаем .env переменные
+# ==============================
+load_dotenv()
 
-# === Переменные окружения ===
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-BYBIT_API_KEY = os.environ.get("BYBIT_API_KEY")
-BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET")
-USE_TESTNET = os.environ.get("USE_TESTNET", "True").lower() == "true"
-RENDER_EXTERNAL_HOSTNAME = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+BYBIT_API_KEY = os.getenv("BYBIT_API_KEY")
+BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET")
+PROXY_URL = os.getenv("PROXY_URL")
 
-if not BOT_TOKEN or not BYBIT_API_KEY or not BYBIT_API_SECRET:
-    raise ValueError("❌ BOT_TOKEN, BYBIT_API_KEY и BYBIT_API_SECRET должны быть заданы в Environment Variables!")
-
-# === Telegram и Flask ===
-bot = telebot.TeleBot(BOT_TOKEN)
+# ==============================
+# Flask app
+# ==============================
 app = Flask(__name__)
 
-# === Bybit API ===
-session = HTTP(
-    testnet=USE_TESTNET,
+# ==============================
+# Настройка сессии с прокси
+# ==============================
+session = requests.Session()
+if PROXY_URL:
+    session.proxies = {
+        "http": PROXY_URL,
+        "https": PROXY_URL
+    }
+
+# ==============================
+# Подключаемся к Bybit
+# ==============================
+client = HTTP(
+    testnet=False,  # если используешь реальный Bybit, ставь False
     api_key=BYBIT_API_KEY,
-    api_secret=BYBIT_API_SECRET
+    api_secret=BYBIT_API_SECRET,
+    request_timeout=10,
+    session=session
 )
 
-# === Команда /start ===
-@bot.message_handler(commands=['start'])
-def start(message):
-    markup = types.InlineKeyboardMarkup()
-    btn_price = types.InlineKeyboardButton("💰 Узнать цену BTCUSDT", callback_data="price_BTCUSDT")
-    markup.add(btn_price)
-    bot.send_message(message.chat.id, "👋 Привет! Я крипто-бот. Нажми кнопку ниже:", reply_markup=markup)
+# ==============================
+# Телеграм API
+# ==============================
+TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-# === Команда /price вручную ===
-@bot.message_handler(commands=['price'])
-def price_command(message):
-    parts = message.text.split()
-    if len(parts) < 2:
-        bot.reply_to(message, "⚠️ Используй формат: /price BTCUSDT")
-        return
+def send_message(chat_id, text, reply_markup=None):
+    """Отправка сообщений в Telegram"""
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    requests.post(f"{TELEGRAM_API}/sendMessage", json=payload)
 
-    symbol = parts[1].upper()
-    send_price(message.chat.id, symbol)
-
-# === Обработка нажатий на кнопку ===
-@bot.callback_query_handler(func=lambda call: call.data.startswith("price_"))
-def callback_price(call):
-    symbol = call.data.split("_")[1]
-    send_price(call.message.chat.id, symbol)
-    bot.answer_callback_query(call.id)
-
-# === Универсальная функция получения цены ===
-def send_price(chat_id, symbol):
-    try:
-        data = session.get_tickers(category="linear", symbol=symbol)
-        price = data['result']['list'][0]['lastPrice']
-        bot.send_message(chat_id, f"💰 Текущая цена {symbol}: {price}")
-    except Exception as e:
-        logger.error(f"Ошибка при получении цены {symbol}: {e}")
-        bot.send_message(chat_id, "❌ Не удалось получить данные о цене.")
-
-# === Flask Webhook ===
-@app.route(f"/{BOT_TOKEN}", methods=['POST'])
+# ==============================
+# Главная логика
+# ==============================
+@app.route(f"/{BOT_TOKEN}", methods=["POST"])
 def webhook():
-    json_str = request.get_data().decode('utf-8')
-    update = telebot.types.Update.de_json(json_str)
-    bot.process_new_updates([update])
-    return "OK", 200
+    data = request.get_json()
 
-@app.route("/", methods=['GET'])
+    if "message" in data:
+        chat_id = data["message"]["chat"]["id"]
+        text = data["message"].get("text", "").lower()
+
+        if text == "/start":
+            reply_markup = {
+                "keyboard": [
+                    [{"text": "💰 Price"}],
+                    [{"text": "ℹ️ Help"}]
+                ],
+                "resize_keyboard": True
+            }
+            send_message(chat_id, "Привет! 👋 Я бот для Bybit.\nВыбери действие:", reply_markup)
+            return "ok"
+
+        elif text == "💰 price" or text == "price":
+            try:
+                ticker = client.get_tickers(category="spot", symbol="BTCUSDT")
+                price = ticker["result"]["list"][0]["lastPrice"]
+                send_message(chat_id, f"💎 Текущая цена BTC/USDT: *{price}* $")
+            except Exception as e:
+                send_message(chat_id, f"Ошибка при получении цены: {e}")
+
+        elif text == "ℹ️ help" or text == "help":
+            send_message(chat_id, "Доступные команды:\n- 💰 Price — узнать цену BTC\n- ℹ️ Help — помощь")
+
+        else:
+            send_message(chat_id, "Неизвестная команда. Нажми /start для меню.")
+
+    return "ok"
+
+
+@app.route("/", methods=["GET"])
 def index():
-    return "🚀 Bot is running on Render!", 200
+    return "Bot is running!", 200
 
-# === Точка входа ===
+
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    logger.info(f"🚀 Бот запущен на порту {port}")
+    # Устанавливаем вебхук
+    if WEBHOOK_URL:
+        webhook_url = f"{WEBHOOK_URL}/{BOT_TOKEN}"
+        r = requests.get(f"{TELEGRAM_API}/setWebhook?url={webhook_url}")
+        print(f"Webhook set: {r.text}")
 
-    # Настройка вебхука
-    if RENDER_EXTERNAL_HOSTNAME:
-        webhook_url = f"https://{RENDER_EXTERNAL_HOSTNAME}/{BOT_TOKEN}"
-        bot.remove_webhook()
-        bot.set_webhook(url=webhook_url)
-        logger.info(f"🌐 Вебхук установлен: {webhook_url}")
-    else:
-        logger.warning("⚠️ RENDER_EXTERNAL_HOSTNAME не задан, вебхук не установлен.")
-
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=10000)
