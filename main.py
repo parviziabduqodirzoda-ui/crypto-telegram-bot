@@ -5,9 +5,10 @@ import telebot
 from telebot import types
 from flask import Flask, request
 
-# === Telegram токен ===
-TOKEN = "7603757075:AAEGAqO0CzWy-0lT-Zp6rjagNvXmxx9CsSs"
+# === Telegram токен из переменных окружения ===
+TOKEN = os.getenv("BOT_TOKEN")
 bot = telebot.TeleBot(TOKEN)
+
 
 # === Flask сервер для Render ===
 app = Flask(__name__)
