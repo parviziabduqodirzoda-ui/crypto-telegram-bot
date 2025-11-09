@@ -1,85 +1,89 @@
 import os
-import time
-import requests
+import logging
+from flask import Flask, request
 import telebot
 from telebot import types
-from flask import Flask, request
+from pybit.unified_trading import HTTP
 
-# === Telegram токен из переменных окружения ===
-TOKEN = os.getenv("BOT_TOKEN")
-bot = telebot.TeleBot(TOKEN)
+# Настройки логов
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
+# Загружаем переменные окружения
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+BYBIT_API_KEY = os.getenv("BYBIT_API_KEY")
+BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET")
+USE_TESTNET = os.getenv("USE_TESTNET", "False").lower() == "true"
 
-# === Flask сервер для Render ===
+# Проверяем переменные
+if not BOT_TOKEN or not BYBIT_API_KEY or not BYBIT_API_SECRET:
+    logger.error("❌ Не найдены ключи в переменных окружения. Проверь Render Environment Variables.")
+    exit(1)
+
+# Подключение к Bybit API
+session = HTTP(
+    testnet=USE_TESTNET,
+    api_key=BYBIT_API_KEY,
+    api_secret=BYBIT_API_SECRET,
+)
+
+# Telegram Bot
+bot = telebot.TeleBot(BOT_TOKEN)
+ADMIN_ID = 5198342012
+
+# Flask для Render
 app = Flask(__name__)
 
-# === Список активов для мониторинга ===
-ASSETS = [
-    "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
-    "DOGEUSDT", "ADAUSDT", "TRXUSDT", "AVAXUSDT", "DOTUSDT",
-    "LINKUSDT", "MATICUSDT", "LTCUSDT", "SHIBUSDT", "APTUSDT",
-    "NEARUSDT", "TONUSDT", "BCHUSDT", "ATOMUSDT", "SUIUSDT"
+# Список торговых пар
+symbols = [
+    "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
+    "DOGEUSDT", "ADAUSDT", "TRXUSDT", "DOTUSDT", "AVAXUSDT",
+    "MATICUSDT", "LTCUSDT", "LINKUSDT", "BCHUSDT", "UNIUSDT",
+    "ATOMUSDT", "XLMUSDT", "FILUSDT", "NEARUSDT", "ALGOUSDT"
 ]
 
-# === Функция получения цены с Bybit ===
-def get_price(symbol):
-    try:
-        url = f"https://api.bybit.com/v5/market/tickers?category=spot&symbol={symbol}"
-        r = requests.get(url, timeout=5)
-        data = r.json()
-        if "result" in data and data["result"]["list"]:
-            return float(data["result"]["list"][0]["lastPrice"])
-        else:
-            return None
-    except Exception:
-        return None
-
-
-# === Команда /start ===
-@bot.message_handler(commands=['start'])
+# 🟢 Команда /start
+@bot.message_handler(commands=["start"])
 def start(message):
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    markup.add(types.KeyboardButton("Price"))
-    bot.send_message(
-        message.chat.id,
-        "👋 Привет! Я крипто-бот.\nНажми «Price», чтобы увидеть текущие цены.",
-        reply_markup=markup
-    )
+    btn1 = types.KeyboardButton("Price")
+    markup.add(btn1)
+    bot.send_message(message.chat.id, "🤖 Бот запущен! Нажми 'Price', чтобы получить котировки.", reply_markup=markup)
+    logger.info(f"Пользователь {message.chat.id} запустил бота.")
 
 
-# === Кнопка Price ===
-@bot.message_handler(func=lambda msg: msg.text and msg.text.lower() == "price")
-def send_prices(message):
-    bot.send_message(message.chat.id, "📊 Загружаю данные с Bybit...")
-    text = "💰 *Текущие цены на 20 активов:*\n\n"
-    for symbol in ASSETS:
-        price = get_price(symbol)
-        if price:
-            text += f"▫️ {symbol}: `${price:.3f}`\n"
-        else:
-            text += f"▫️ {symbol}: _недоступно_\n"
-        time.sleep(0.1)
-    bot.send_message(message.chat.id, text, parse_mode="Markdown")
+# 📈 Обработка кнопки /price
+@bot.message_handler(func=lambda message: message.text.lower() == "price" or message.text.lower() == "/price")
+def get_prices(message):
+    logger.info(f"Запрос цен от пользователя {message.chat.id}")
+    try:
+        prices = []
+        for symbol in symbols:
+            try:
+                data = session.get_tickers(category="linear", symbol=symbol)
+                price = data["result"]["list"][0]["lastPrice"]
+                prices.append(f"{symbol}: {price}")
+            except Exception as e:
+                prices.append(f"{symbol}: ошибка ❌ ({e})")
+        price_message = "💰 *Актуальные цены:*\n\n" + "\n".join(prices)
+        bot.send_message(message.chat.id, price_message, parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Ошибка получения цен: {e}")
+        bot.send_message(message.chat.id, f"⚠️ Ошибка при получении данных: {e}")
 
 
-# === Flask webhook ===
-@app.route(f'/{TOKEN}', methods=['POST'])
-def getMessage():
-    json_str = request.get_data(as_text=True)
-    update = telebot.types.Update.de_json(json_str)
-    bot.process_new_updates([update])
-    return 'ok', 200
-
-
-@app.route('/')
+# 🧠 Проверка живости (Render healthcheck)
+@app.route("/", methods=["GET", "POST"])
 def webhook():
-    # Устанавливаем webhook при запуске
-    bot.remove_webhook()
-    bot.set_webhook(url=f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME')}/{TOKEN}")
-    return "Webhook установлен успешно!", 200
+    if request.method == "POST":
+        update = telebot.types.Update.de_json(request.stream.read().decode("utf-8"))
+        bot.process_new_updates([update])
+        return "OK", 200
+    else:
+        return "✅ Бот работает!", 200
 
 
-# === Запуск приложения ===
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
+    port = int(os.getenv("PORT", 10000))
+    logger.info(f"🚀 Бот запущен на порту {port}")
     app.run(host="0.0.0.0", port=port)
